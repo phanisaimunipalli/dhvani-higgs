@@ -23,6 +23,23 @@ from emotion import detect_emotion
 
 load_dotenv()
 
+# ─── KMP fix for faster-whisper + numpy coexistence ───
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+# ─── Parakeet/Whisper local ASR (faster-whisper base.en) ───
+# Loaded once at startup — no API calls, no network, flat ~1.3s per chunk
+_whisper_model = None
+
+def get_whisper():
+    global _whisper_model
+    if _whisper_model is None:
+        from faster_whisper import WhisperModel
+        L("[ASR-LOCAL] Loading faster-whisper base.en...")
+        t = time.time()
+        _whisper_model = WhisperModel("base.en", device="cpu", compute_type="int8")
+        L(f"[ASR-LOCAL] Loaded in {time.time()-t:.1f}s")
+    return _whisper_model
+
 # ─── Gemini (Brain) ───
 from google import genai as _genai
 _gemini_client: "_genai.Client | None" = None
@@ -103,6 +120,12 @@ async def get_http() -> httpx.AsyncClient:
             limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
         )
     return _http
+
+@app.on_event("startup")
+async def startup():
+    # Pre-load local ASR model in background so first request isn't slow
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(None, get_whisper)
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -468,21 +491,26 @@ async def gemini_translate(text: str, lang: str) -> str | None:
 
 
 async def api_asr(wav_bytes: bytes) -> str | None:
-    if not EIGEN_KEY: return None
+    """Local ASR via faster-whisper base.en — ~1.3s flat, no API calls, no spikes."""
     try:
-        client = await get_http()
-        resp = await client.post(
-            f"{EIGEN_BASE}/api/v1/generate",
-            headers={"Authorization": f"Bearer {EIGEN_KEY}"},
-            files={"file": ("audio.wav", wav_bytes, "audio/wav")},
-            data={"model": "higgs_asr_3", "task": "asr"},
-        )
-        if resp.status_code != 200:
-            L(f"[ASR] HTTP {resp.status_code}")
-            return None
-        return resp.json().get("transcription", "").strip() or None
+        # Decode wav bytes → float32 numpy array
+        buf = io.BytesIO(wav_bytes)
+        with wave.open(buf, "rb") as wf:
+            frames = wf.readframes(wf.getnframes())
+            sr = wf.getframerate()
+        audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+
+        # Run in executor so it doesn't block the event loop
+        loop = asyncio.get_event_loop()
+        def _transcribe():
+            model = get_whisper()
+            segs, _ = model.transcribe(audio, beam_size=1, language="en", condition_on_previous_text=False)
+            return " ".join(s.text for s in segs).strip()
+
+        text = await loop.run_in_executor(None, _transcribe)
+        return text or None
     except Exception as e:
-        L(f"[ASR] Error: {e}")
+        L(f"[ASR-LOCAL] Error: {e}")
         return None
 
 

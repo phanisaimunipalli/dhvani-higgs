@@ -11,3 +11,6 @@ build/
 *.wav
 *.mp3
 *.tmp
+venv_x86/
+venv/
+.cache/
