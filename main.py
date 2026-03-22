@@ -1,24 +1,20 @@
 """
 Dhvani — Real-time YouTube Video Dubbing
-Paste a YouTube URL → Select language → Dubbed audio overlays on video
-100% Higgs Audio powered on Eigen AI.
+Clean rewrite: simple sequential pipeline with full file logging.
 
-Pipeline: ASR → Translate (GPT-OSS) → Streaming TTS (Higgs 2.5)
-Streaming TTS sends PCM chunks as they generate → sub-second first audio.
+Design:
+  1. /api/youtube/prepare  → download YT audio, split into 3s chunks, store in session
+  2. /ws/dub/{session_id}  → WebSocket: client sends {lang}, server streams dubbed chunks
+  3. Per chunk: ASR → AST (parallel) → GPT-OSS fallback → Higgs TTS → send WAV to client
+
+Logging: every API call timed and written to dhvani.log
 """
 
 from __future__ import annotations
-import asyncio
-import base64
-import io
-import json
-import os
-import time
-import wave
+import asyncio, base64, io, json, logging, os, time, wave
 from pathlib import Path
 
-import httpx
-import numpy as np
+import httpx, numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse
@@ -27,163 +23,216 @@ from emotion import detect_emotion
 
 load_dotenv()
 
-app = FastAPI(title="Dhvani", version="2.0.0")
+# ─── Gemini (Brain) ───
+from google import genai as _genai
+_gemini_client: "_genai.Client | None" = None
 
+def get_gemini():
+    global _gemini_client
+    if _gemini_client is None:
+        key = os.environ.get("GEMINI_API_KEY", "")
+        if key:
+            _gemini_client = _genai.Client(api_key=key)
+    return _gemini_client
+
+# ─── File logger ───
+LOG_FILE = Path(__file__).parent / "dhvani.log"
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, mode="a"),
+        logging.StreamHandler(),          # also print to console
+    ]
+)
+log = logging.getLogger("dhvani")
+
+def L(msg: str):
+    """Shorthand logger — writes to dhvani.log and console."""
+    log.info(msg)
+
+# ─── Config ───
+app = FastAPI(title="Dhvani", version="3.0.0")
 STATIC_DIR = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 EIGEN_BASE = "https://api-web.eigenai.com"
-EIGEN_KEY = os.environ.get("BOSONAI_API_KEY", "")
+EIGEN_KEY  = os.environ.get("BOSONAI_API_KEY", "")
 
 LANGUAGES = {
     "en": "English", "zh": "Chinese", "ko": "Korean",
     "ja": "Japanese", "es": "Spanish", "fr": "French",
-    "de": "German", "it": "Italian", "ru": "Russian",
+    "de": "German",  "it": "Italian", "ru": "Russian",
 }
-
 DUB_LANGUAGES = {
     "es": {"name": "Spanish", "flag": "ES"},
     "ja": {"name": "Japanese", "flag": "JP"},
-    "zh": {"name": "Chinese", "flag": "CN"},
+    "zh": {"name": "Chinese",  "flag": "CN"},
 }
 
-# ─── Persistent HTTP client ───
+# ─── Disk cache ───
+CACHE_DIR = Path(__file__).parent / ".cache"
+CACHE_DIR.mkdir(exist_ok=True)
+
+def cache_path(video_id: str, lang: str, idx: int) -> Path:
+    return CACHE_DIR / f"{video_id}_{lang}_{idx}.json"
+
+def load_chunk_cache(video_id: str, lang: str, total: int) -> dict:
+    out = {}
+    for i in range(total):
+        p = cache_path(video_id, lang, i)
+        if p.exists():
+            try: out[i] = json.loads(p.read_text())
+            except: pass
+    if out:
+        L(f"[CACHE] Loaded {len(out)}/{total} chunks from disk for {video_id}/{lang}")
+    return out
+
+def save_chunk_cache(video_id: str, lang: str, idx: int, result: dict):
+    try: cache_path(video_id, lang, idx).write_text(json.dumps(result))
+    except Exception as e: L(f"[CACHE] Save error chunk {idx}: {e}")
+
+# ─── HTTP client (persistent, pooled) ───
 _http: httpx.AsyncClient | None = None
 
 async def get_http() -> httpx.AsyncClient:
     global _http
     if _http is None or _http.is_closed:
         _http = httpx.AsyncClient(
-            timeout=httpx.Timeout(30.0, connect=10.0),
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+            timeout=httpx.Timeout(60.0, connect=10.0),
+            limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
         )
     return _http
-
 
 @app.on_event("shutdown")
 async def shutdown():
     global _http
-    if _http:
-        await _http.aclose()
+    if _http: await _http.aclose()
 
+# ─── Sessions ───
+_sessions: dict[str, dict] = {}
 
+# ─── Routes ───
 @app.get("/")
 async def index():
     return FileResponse(str(STATIC_DIR / "index.html"))
 
-
 @app.get("/health")
 async def health():
-    return {"status": "Dhvani online", "version": "2.0.0"}
-
-
-# ─── Session state ───
-_sessions: dict[str, dict] = {}
+    return {"status": "ok", "version": "3.0.0"}
 
 
 @app.post("/api/youtube/prepare")
 async def youtube_prepare(request: Request):
     body = await request.json()
-    url = body.get("url", "").strip()
+    url  = body.get("url", "").strip()
     if not url:
-        return JSONResponse({"error": "No URL provided"}, status_code=400)
+        return JSONResponse({"error": "No URL"}, status_code=400)
 
     import re, tempfile, subprocess
-
-    vid_match = re.search(r'(?:v=|youtu\.be/|shorts/)([a-zA-Z0-9_-]{11})', url)
-    if not vid_match:
+    m = re.search(r'(?:v=|youtu\.be/|shorts/)([a-zA-Z0-9_-]{11})', url)
+    if not m:
         return JSONResponse({"error": "Invalid YouTube URL"}, status_code=400)
-    video_id = vid_match.group(1)
+    video_id = m.group(1)
 
+    # ── Download ──
+    t0 = time.time()
+    L(f"[PREPARE] Downloading video_id={video_id}")
     try:
         from pytubefix import YouTube
-        yt = YouTube(url)
+        yt    = YouTube(url)
         title = yt.title
-        print(f"[YT] Downloading: {title} ({yt.length}s)")
-        audio_stream = yt.streams.filter(only_audio=True).order_by("abr").desc().first()
-        if not audio_stream:
-            return JSONResponse({"error": "No audio stream found"}, status_code=400)
-        tmp_dir = tempfile.mkdtemp(prefix="dhvani_yt_")
-        dl_path = audio_stream.download(output_path=tmp_dir, filename="audio")
+        stream = yt.streams.filter(only_audio=True).order_by("abr").desc().first()
+        if not stream:
+            return JSONResponse({"error": "No audio stream"}, status_code=400)
+        tmp_dir  = tempfile.mkdtemp(prefix="dhvani_")
+        dl_path  = stream.download(output_path=tmp_dir, filename="audio")
     except Exception as e:
         return JSONResponse({"error": f"Download failed: {e}"}, status_code=400)
+    L(f"[PREPARE] Download done in {time.time()-t0:.1f}s — {title}")
 
+    # ── Convert to WAV 16kHz mono ──
+    t1 = time.time()
     wav_path = os.path.join(tmp_dir, "audio.wav")
     try:
         subprocess.run(
-            ["ffmpeg", "-y", "-i", dl_path, "-ar", "16000", "-ac", "1", "-f", "wav", wav_path],
+            ["ffmpeg", "-y", "-i", dl_path,
+             "-ar", "16000", "-ac", "1", "-f", "wav", wav_path],
             capture_output=True, timeout=60,
         )
     except Exception as e:
-        return JSONResponse({"error": f"Conversion failed: {e}"}, status_code=400)
-
+        return JSONResponse({"error": f"ffmpeg failed: {e}"}, status_code=400)
     if not os.path.exists(wav_path):
-        return JSONResponse({"error": "Conversion produced no output"}, status_code=400)
+        return JSONResponse({"error": "ffmpeg produced no output"}, status_code=400)
+    L(f"[PREPARE] ffmpeg done in {time.time()-t1:.1f}s")
 
-    try:
-        with wave.open(wav_path, "rb") as wf:
-            frames = wf.readframes(wf.getnframes())
-            data = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
-    except Exception as e:
-        return JSONResponse({"error": f"Could not decode: {e}"}, status_code=400)
-
-    if data.ndim > 1:
-        data = data.mean(axis=1)
-
-    CHUNK_S = 3
-    chunk_samples = 16000 * CHUNK_S
-    chunks = []
-    for i in range(0, len(data), chunk_samples):
-        seg = data[i:i + chunk_samples]
-        if len(seg) < 1600:
-            continue
-        pcm = (np.clip(seg, -1, 1) * 32767).astype(np.int16)
-        start_s = round(i / 16000, 2)
-        dur_s = round(len(seg) / 16000, 2)
-        chunks.append({"pcm": pcm.tobytes(), "start_s": start_s, "duration_s": dur_s})
-
-    voice_ref = _pick_voice_ref(chunks)
-
+    # ── Read audio ──
+    with wave.open(wav_path, "rb") as wf:
+        frames = wf.readframes(wf.getnframes())
+    data = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+    if data.ndim > 1: data = data.mean(axis=1)
     duration = len(data) / 16000
-    session_id = f"yt_{video_id}_{int(time.time())}"
 
+    # ── Fixed 3s chunks ──
+    CHUNK_S     = 3
+    chunk_samp  = 16000 * CHUNK_S
+    chunks      = []
+    for i in range(0, len(data), chunk_samp):
+        seg = data[i:i + chunk_samp]
+        if len(seg) < 1600: continue
+        pcm = (np.clip(seg, -1, 1) * 32767).astype(np.int16)
+        chunks.append({
+            "pcm":      pcm.tobytes(),
+            "start_s":  round(i / 16000, 2),
+            "dur_s":    round(len(seg) / 16000, 2),
+        })
+
+    # ── Pick voice reference (loudest of first 5 chunks) ──
+    voice_ref = None
+    best_rms  = 0.0
+    for c in chunks[:5]:
+        a   = np.frombuffer(c["pcm"], dtype=np.int16).astype(np.float32) / 32768.0
+        rms = float(np.sqrt(np.mean(a ** 2)))
+        if rms > best_rms:
+            best_rms = rms
+            voice_ref = pcm_to_wav(c["pcm"], 16000)
+    if best_rms < 0.01: voice_ref = None
+
+    # ── Load disk cache for all languages ──
+    lang_caches = {lang: load_chunk_cache(video_id, lang, len(chunks)) for lang in DUB_LANGUAGES}
+
+    session_id = f"yt_{video_id}_{int(time.time())}"
     _sessions[session_id] = {
-        "chunks": chunks,
-        "video_id": video_id,
-        "title": title,
-        "duration": duration,
+        "video_id":  video_id,
+        "title":     title,
+        "duration":  duration,
+        "chunks":    chunks,
+        "total":     len(chunks),
         "voice_ref": voice_ref,
-        "total": len(chunks),
-        "cache": {lang: {} for lang in DUB_LANGUAGES},
+        "cache":     lang_caches,
     }
 
     try:
-        import shutil
-        shutil.rmtree(tmp_dir, ignore_errors=True)
-    except Exception:
-        pass
+        import shutil; shutil.rmtree(tmp_dir, ignore_errors=True)
+    except: pass
 
-    chunk_times = [{"start": c["start_s"], "dur": c["duration_s"]} for c in chunks]
-    print(f"[YT] Ready: {title} | {duration:.1f}s, {len(chunks)} chunks ({CHUNK_S}s each)")
+    chunk_times = [{"start": c["start_s"], "dur": c["dur_s"]} for c in chunks]
+    L(f"[PREPARE] Ready: {len(chunks)} chunks | {duration:.1f}s | session={session_id}")
 
     return {
-        "session_id": session_id,
-        "video_id": video_id,
-        "title": title,
-        "duration": round(duration, 1),
-        "chunks": len(chunks),
+        "session_id":  session_id,
+        "video_id":    video_id,
+        "title":       title,
+        "duration":    round(duration, 1),
+        "chunks":      len(chunks),
         "chunk_times": chunk_times,
-        "languages": DUB_LANGUAGES,
+        "languages":   DUB_LANGUAGES,
     }
 
 
+# ─── WebSocket dubbing ───
 @app.websocket("/ws/dub/{session_id}")
 async def ws_dub(websocket: WebSocket, session_id: str):
-    """
-    Streaming dubbing pipeline:
-    ASR → GPT-OSS Translate → Streaming TTS (SSE, PCM chunks)
-    Sends audio as WAV base64 per chunk for client playback.
-    """
     await websocket.accept()
     session = _sessions.get(session_id)
     if not session:
@@ -191,295 +240,235 @@ async def ws_dub(websocket: WebSocket, session_id: str):
         await websocket.close()
         return
 
-    chunks = session["chunks"]
-    total = session["total"]
+    chunks    = session["chunks"]
+    total     = session["total"]
     voice_ref = session["voice_ref"]
-    cache = session["cache"]
+    cache     = session["cache"]
+    video_id  = session["video_id"]
     active_task: asyncio.Task | None = None
-    cancel_flag = {"cancelled": False}
+    flag = {"cancelled": False}
 
-    async def stream_lang(lang: str, from_idx: int, flag: dict):
-        """
-        Parallel pipeline: process N chunks simultaneously, send to client in order.
-        With 4 workers: 4x faster than sequential processing.
-        """
+    L(f"[WS] Connected: {session_id} ({total} chunks)")
+
+    # ── 3-Queue Pipeline: ASR → Brain(Gemini) → TTS — all overlapping ──
+    async def dub_lang(lang: str, from_idx: int):
         lang_cache = cache.get(lang, {})
-        lang_name = LANGUAGES.get(lang, "English")
-        clone_active = voice_ref is not None and len(voice_ref) > 3200
-        PARALLEL = 4  # concurrent chunk workers
-        sem = asyncio.Semaphore(PARALLEL)
-        # results[i] = dict (chunk result) | "skip" | "silent" | None (not done yet)
-        results: dict[int, object] = {}
+        lang_name  = LANGUAGES.get(lang, "English")
+        clone      = voice_ref is not None and len(voice_ref) > 3200
 
-        async def process_one(i: int):
-            if flag["cancelled"]:
-                results[i] = "silent"
-                return
+        # Bounded queues prevent runaway memory if TTS is slow
+        text_q = asyncio.Queue(maxsize=6)   # ASR → Brain
+        tts_q  = asyncio.Queue(maxsize=6)   # Brain → TTS
 
-            chunk_info = chunks[i]
-            pcm_bytes = chunk_info["pcm"]
-            chunk_start_s = chunk_info["start_s"]
-            chunk_dur_s = chunk_info["duration_s"]
-            audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-            rms = float(np.sqrt(np.mean(audio ** 2)))
-            if rms < 0.005:
-                results[i] = "silent"
-                return
+        L(f"[PIPELINE:{lang}] Start from {from_idx}/{total} | cached={len(lang_cache)}")
 
-            async with sem:
-                if flag["cancelled"]:
-                    results[i] = "silent"
-                    return
+        # ── Stage 1: ASR ── runs ahead, pushes text to brain ──
+        async def asr_stage():
+            for i in range(from_idx, total):
+                if flag["cancelled"]: break
 
-                t0 = time.time()
-                emo = detect_emotion(pcm_bytes, 16000)
-                wav_bytes = _pcm_to_wav(pcm_bytes, 16000)
-                if not wav_bytes:
-                    results[i] = "silent"
-                    return
+                if i in lang_cache:
+                    await text_q.put(("cached", i, None, None, None, None))
+                    continue
 
-                # ASR + AST in parallel
-                t_asr = time.time()
-                transcript, ast_translation = await asyncio.gather(
-                    _higgs_asr(wav_bytes),
-                    _higgs_asr_translate(wav_bytes, lang_name),
-                )
-                ms_asr = int((time.time() - t_asr) * 1000)
-                print(f"[Dub] [{lang}] {i+1}/{total} ASR+AST: {ms_asr}ms | \"{(transcript or '')[:35]}\" -> \"{(ast_translation or '')[:35]}\"")
+                chunk   = chunks[i]
+                pcm_raw = chunk["pcm"]
+                audio   = np.frombuffer(pcm_raw, dtype=np.int16).astype(np.float32) / 32768.0
+                rms     = float(np.sqrt(np.mean(audio ** 2)))
 
-                if not transcript or _is_noise(transcript):
-                    results[i] = "silent"
-                    return
+                if rms < 0.005:
+                    await text_q.put(("silent", i, None, None, None, None))
+                    continue
 
-                translation = ast_translation
-                if not translation or translation == transcript or _is_noise(translation):
-                    t_fb = time.time()
-                    translation = await _translate(transcript, lang)
-                    print(f"[Dub] [{lang}] {i+1}/{total} GPT-OSS fallback: {int((time.time()-t_fb)*1000)}ms")
+                wav_bytes = pcm_to_wav(pcm_raw, 16000)
+                emo       = detect_emotion(pcm_raw, 16000)
+                t_start   = time.time()
 
-                if not translation or translation == transcript:
-                    print(f"[Dub] [{lang}] {i+1}/{total} SKIP no translation")
-                    results[i] = {"_skip": True, "transcript": transcript,
-                                  "start_s": chunk_start_s, "duration_s": chunk_dur_s}
-                    return
+                t = time.time()
+                transcript = await api_asr(wav_bytes)
+                L(f"[ASR:{lang}] {i+1}/{total}: {int((time.time()-t)*1000)}ms | \"{(transcript or '')[:40]}\"")
 
-                # TTS
-                t_tts = time.time()
-                tts_pcm = await _higgs_tts_stream(translation, emo["speed"], voice_ref)
-                ms_tts = int((time.time() - t_tts) * 1000)
-                print(f"[Dub] [{lang}] {i+1}/{total} TTS: {ms_tts}ms | clone={clone_active} | TOTAL: {int((time.time()-t0)*1000)}ms")
-
-                if tts_pcm and len(tts_pcm) > 1000:
-                    tts_wav = tts_pcm if clone_active else _pcm_to_wav_24k(tts_pcm)
-                    tts_b64 = base64.b64encode(tts_wav).decode() if tts_wav else None
+                if not transcript or is_noise(transcript):
+                    await text_q.put(("silent", i, None, None, None, None))
                 else:
-                    tts_b64 = None
+                    await text_q.put(("text", i, transcript, wav_bytes, emo, t_start))
 
-                results[i] = {
-                    "transcript": transcript,
+            await text_q.put(None)  # sentinel
+
+        # ── Stage 2: Brain (Gemini) ── translates, pushes to TTS ──
+        async def brain_stage():
+            while True:
+                item = await text_q.get()
+                if item is None:
+                    await tts_q.put(None)
+                    break
+
+                kind, i, transcript, wav_bytes, emo, t_start = item
+                chunk = chunks[i]
+
+                if kind in ("cached", "silent"):
+                    await tts_q.put((kind, i, None, None, None, chunk, t_start))
+                    continue
+
+                # Gemini Flash Lite: ~200-400ms, no rate limits
+                t = time.time()
+                translation = await gemini_translate(transcript, lang)
+                ms_g = int((time.time() - t) * 1000)
+
+                if translation and translation.strip() != transcript.strip():
+                    L(f"[BRAIN:Gemini:{lang}] {i+1}/{total}: {ms_g}ms | \"{translation[:40]}\"")
+                else:
+                    # Fallback: Higgs AST
+                    t = time.time()
+                    translation = await api_ast(wav_bytes, lang_name)
+                    L(f"[BRAIN:AST:{lang}] {i+1}/{total}: {int((time.time()-t)*1000)}ms | \"{(translation or '')[:40]}\"")
+
+                    if not translation or translation.strip() == transcript.strip():
+                        # Last resort: GPT-OSS
+                        t = time.time()
+                        translation = await api_translate(transcript, lang)
+                        L(f"[BRAIN:GPT:{lang}] {i+1}/{total}: {int((time.time()-t)*1000)}ms | \"{(translation or '')[:40]}\"")
+
+                if not translation or translation.strip() == transcript.strip():
+                    await tts_q.put(("skip", i, transcript, None, None, chunk, t_start))
+                else:
+                    await tts_q.put(("speak", i, transcript, translation, emo, chunk, t_start))
+
+        # ── Stage 3: TTS ── generates audio, sends to client ──
+        async def tts_stage():
+            while True:
+                item = await tts_q.get()
+                if item is None: break
+                if flag["cancelled"]: continue
+
+                kind, i, transcript, translation, emo, chunk, t_start = item
+
+                if kind == "silent":
+                    continue
+
+                if kind == "cached":
+                    r = lang_cache[i]
+                    try:
+                        await websocket.send_json({
+                            "type": "chunk", "index": i, "total": total, "cached": True, **r
+                        })
+                    except: break
+                    L(f"[TTS:{lang}] {i+1}/{total} CACHED ⚡")
+                    continue
+
+                if kind == "skip":
+                    try:
+                        await websocket.send_json({
+                            "type": "skip", "index": i, "total": total,
+                            "transcript": transcript or "",
+                        })
+                    except: break
+                    continue
+
+                t = time.time()
+                tts_raw = await api_tts(translation, emo["speed"], voice_ref if clone else None)
+                ms_tts  = int((time.time() - t) * 1000)
+                L(f"[TTS:{lang}] {i+1}/{total}: {ms_tts}ms | {len(tts_raw) if tts_raw else 0}bytes | clone={clone}")
+
+                if not tts_raw or len(tts_raw) < 1000:
+                    L(f"[TTS:{lang}] {i+1}/{total} SKIP (tts empty)")
+                    continue
+
+                tts_wav  = tts_raw if clone else pcm_to_wav(tts_raw, 24000)
+                tts_b64  = base64.b64encode(tts_wav).decode() if tts_wav else None
+                total_ms = int((time.time() - t_start) * 1000)
+                L(f"[TTS:{lang}] {i+1}/{total} DONE ✓ pipeline={total_ms}ms | \"{(transcript or '')[:30]}\" → \"{translation[:30]}\"")
+
+                result = {
+                    "transcript":  transcript,
                     "translation": translation,
-                    "audio_b64": tts_b64,
-                    "emotion": {"emoji": emo["emoji"], "label": emo["label"]},
-                    "latency": int((time.time() - t0) * 1000),
-                    "start_s": chunk_start_s,
-                    "duration_s": chunk_dur_s,
+                    "audio_b64":   tts_b64,
+                    "emotion":     {"emoji": emo["emoji"], "label": emo["label"]},
+                    "latency":     total_ms,
+                    "start_s":     chunk["start_s"],
+                    "dur_s":       chunk["dur_s"],
                 }
-                lang_cache[i] = results[i]
+                lang_cache[i] = result
+                save_chunk_cache(video_id, lang, i, result)
 
-        # Pre-fill cache hits so process_one doesn't need to touch them
-        for i in range(from_idx, total):
-            if i in lang_cache:
-                results[i] = lang_cache[i]
-
-        # Launch all worker tasks in parallel
-        tasks = [
-            asyncio.create_task(process_one(i))
-            for i in range(from_idx, total)
-            if i not in lang_cache
-        ]
-        print(f"[Dub] [{lang}] launched {len(tasks)} parallel tasks (PARALLEL={PARALLEL})")
-
-        # Send results to client in order as they complete
-        next_i = from_idx
-        while next_i < total and not flag["cancelled"]:
-            if next_i not in results:
-                await asyncio.sleep(0.05)
-                continue
-
-            r = results[next_i]
-            try:
-                if r == "silent":
-                    pass  # skip silently
-                elif isinstance(r, dict) and r.get("_skip"):
+                if flag["cancelled"]: break
+                try:
                     await websocket.send_json({
-                        "type": "skip", "index": next_i, "total": total,
-                        "transcript": r["transcript"],
+                        "type": "chunk", "index": i, "total": total, "cached": False, **result
                     })
-                elif isinstance(r, dict):
-                    await websocket.send_json({
-                        "type": "chunk", "index": next_i, "total": total,
-                        "cached": next_i in lang_cache and r is lang_cache.get(next_i), **r,
-                    })
-            except Exception:
-                flag["cancelled"] = True
-                break
+                except: break
 
-            next_i += 1
+            if not flag["cancelled"]:
+                L(f"[PIPELINE:{lang}] Done — all chunks processed")
+                try: await websocket.send_json({"type": "done", "lang": lang})
+                except: pass
 
-        # Cancel any still-running tasks on cancel/done
-        for t in tasks:
-            if not t.done():
-                t.cancel()
+        # All 3 stages run concurrently — the actual pipeline
+        await asyncio.gather(asr_stage(), brain_stage(), tts_stage())
 
-        if not flag["cancelled"]:
-            try:
-                await websocket.send_json({"type": "done", "lang": lang})
-            except Exception:
-                pass
-
-    async def cancel_active():
+    async def cancel():
         nonlocal active_task
         if active_task and not active_task.done():
-            cancel_flag["cancelled"] = True
+            flag["cancelled"] = True
             active_task.cancel()
-            try:
-                await active_task
-            except (asyncio.CancelledError, Exception):
-                pass
+            try: await active_task
+            except: pass
 
     try:
         await websocket.send_json({"type": "ready", "total": total})
 
         while True:
             data = await websocket.receive_text()
-            msg = json.loads(data)
+            msg  = json.loads(data)
 
             if msg["type"] in ("play", "switch"):
-                await cancel_active()
-                lang = msg.get("lang", "es")
+                await cancel()
+                lang     = msg.get("lang", "es")
                 from_idx = max(0, min(msg.get("from", 0), total - 1))
-                cancel_flag["cancelled"] = False
-                print(f"[Dub] {msg['type']} {lang} from chunk {from_idx}")
+                flag["cancelled"] = False
+                L(f"[WS] {msg['type'].upper()} lang={lang} from={from_idx}")
                 await websocket.send_json({"type": "playing", "lang": lang, "from": from_idx})
-                active_task = asyncio.create_task(stream_lang(lang, from_idx, cancel_flag))
+                active_task = asyncio.create_task(dub_lang(lang, from_idx))
 
             elif msg["type"] == "stop":
-                await cancel_active()
+                await cancel()
                 await websocket.send_json({"type": "stopped"})
+                L("[WS] Stopped by client")
 
     except WebSocketDisconnect:
-        cancel_flag["cancelled"] = True
-        if active_task:
-            active_task.cancel()
-        print(f"[WS] Disconnected: {session_id}")
+        flag["cancelled"] = True
+        if active_task: active_task.cancel()
+        L(f"[WS] Disconnected: {session_id}")
     except Exception as e:
-        print(f"[WS Error] {e}")
+        L(f"[WS] Error: {e}")
 
 
-# ─── Helpers ───
+# ─── API helpers ───
 
-def _vad_chunk(data: np.ndarray, sr: int = 16000) -> list[dict]:
-    """
-    Split audio into chunks at natural silence/pause boundaries.
-    Energy-based VAD — no extra dependencies needed.
-    Returns list of {"pcm": bytes, "start_s": float, "duration_s": float}
-    """
-    MIN_CHUNK_S = 1.5
-    MAX_CHUNK_S = 8.0
-    MIN_SILENCE_S = 0.3
-    FRAME_MS = 30
-
-    frame_len = int(sr * FRAME_MS / 1000)  # 480 samples at 16kHz
-    n_frames = len(data) // frame_len
-
-    if n_frames < 10:
-        pcm = (np.clip(data, -1, 1) * 32767).astype(np.int16).tobytes()
-        return [{"pcm": pcm, "start_s": 0.0, "duration_s": len(data) / sr}]
-
-    # Energy per frame
-    energies = np.array([
-        float(np.sqrt(np.mean(data[i * frame_len:(i + 1) * frame_len] ** 2)))
-        for i in range(n_frames)
-    ])
-
-    # Adaptive threshold: median * 0.3 or fixed floor
-    thresh = max(0.008, float(np.median(energies)) * 0.3)
-    is_silence = energies < thresh
-
-    min_sil_frames = int(MIN_SILENCE_S * 1000 / FRAME_MS)
-    min_chunk_frames = int(MIN_CHUNK_S * 1000 / FRAME_MS)
-    max_chunk_frames = int(MAX_CHUNK_S * 1000 / FRAME_MS)
-
-    # Find split points at silence gaps
-    splits = [0]
-    sil_start = None
-
-    for i in range(n_frames):
-        if is_silence[i]:
-            if sil_start is None:
-                sil_start = i
-        else:
-            if sil_start is not None:
-                gap = i - sil_start
-                since_split = sil_start - splits[-1]
-                if gap >= min_sil_frames and since_split >= min_chunk_frames:
-                    splits.append(sil_start + gap // 2)
-                sil_start = None
-
-        # Force split at max length
-        if i - splits[-1] >= max_chunk_frames:
-            if sil_start is not None:
-                splits.append(i)
-                sil_start = None
-            else:
-                splits.append(i)
-
-    splits.append(n_frames)
-
-    # Deduplicate and sort
-    splits = sorted(set(splits))
-
-    # Build chunks
-    chunks = []
-    for idx in range(len(splits) - 1):
-        sf, ef = splits[idx], splits[idx + 1]
-        if ef - sf < 3:
-            continue
-        s_sample = sf * frame_len
-        e_sample = min(ef * frame_len, len(data))
-        seg = data[s_sample:e_sample]
-        if len(seg) < 1600:
-            continue
-        pcm = (np.clip(seg, -1, 1) * 32767).astype(np.int16).tobytes()
-        chunks.append({
-            "pcm": pcm,
-            "start_s": round(s_sample / sr, 2),
-            "duration_s": round(len(seg) / sr, 2),
-        })
-
-    if not chunks:
-        # Fallback: single chunk
-        pcm = (np.clip(data, -1, 1) * 32767).astype(np.int16).tobytes()
-        chunks = [{"pcm": pcm, "start_s": 0.0, "duration_s": len(data) / sr}]
-
-    return chunks
-
-
-def _pick_voice_ref(chunks: list[dict]) -> bytes | None:
-    best_wav, best_rms = None, 0.0
-    for c in chunks[:5]:
-        pcm = c["pcm"]
-        audio = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
-        rms = float(np.sqrt(np.mean(audio ** 2)))
-        if rms > best_rms:
-            best_rms = rms
-            best_wav = _pcm_to_wav(pcm, 16000)
-    return best_wav if best_rms > 0.01 else None
-
-
-async def _higgs_asr(wav_bytes: bytes) -> str | None:
-    if not EIGEN_KEY:
+async def gemini_translate(text: str, lang: str) -> str | None:
+    """Fast translation via Gemini Flash Lite — ~200ms, no rate limits."""
+    import re as _re
+    lang_name = LANGUAGES.get(lang, lang)
+    try:
+        client = get_gemini()
+        if not client:
+            return None
+        resp = await client.aio.models.generate_content(
+            model="gemini-3.1-flash-lite-preview",
+            contents=f"Translate to {lang_name}. Reply with ONLY the translated text, no markdown:\n{text}",
+        )
+        result = (resp.text or "").strip()
+        result = _re.sub(r'\*+', '', result).strip("\"'`_ \n")
+        if not result or result.lower() == text.lower(): return None
+        if len(result) > len(text) * 4: return None  # hallucination guard
+        return result
+    except Exception as e:
+        L(f"[Gemini] Error: {e}")
         return None
+
+
+async def api_asr(wav_bytes: bytes) -> str | None:
+    if not EIGEN_KEY: return None
     try:
         client = await get_http()
         resp = await client.post(
@@ -489,17 +478,16 @@ async def _higgs_asr(wav_bytes: bytes) -> str | None:
             data={"model": "higgs_asr_3", "task": "asr"},
         )
         if resp.status_code != 200:
+            L(f"[ASR] HTTP {resp.status_code}")
             return None
         return resp.json().get("transcription", "").strip() or None
     except Exception as e:
-        print(f"[ASR Error] {e}")
+        L(f"[ASR] Error: {e}")
         return None
 
 
-async def _higgs_asr_translate(wav_bytes: bytes, target_lang: str) -> str | None:
-    """AST mode — direct speech-to-text translation via Higgs ASR3."""
-    if not EIGEN_KEY:
-        return None
+async def api_ast(wav_bytes: bytes, target_lang: str) -> str | None:
+    if not EIGEN_KEY: return None
     try:
         client = await get_http()
         resp = await client.post(
@@ -509,118 +497,60 @@ async def _higgs_asr_translate(wav_bytes: bytes, target_lang: str) -> str | None
             data={"model": "higgs_asr_3", "task": "ast", "language": target_lang},
         )
         if resp.status_code != 200:
-            print(f"[AST] HTTP {resp.status_code}")
+            L(f"[AST] HTTP {resp.status_code}")
             return None
-        result = resp.json().get("transcription", "").strip()
-        if result:
-            print(f"[AST] {target_lang}: {result[:60]}")
-        return result or None
+        return resp.json().get("transcription", "").strip() or None
     except Exception as e:
-        print(f"[AST Error] {e}")
+        L(f"[AST] Error: {e}")
         return None
 
 
-async def _translate(text: str, target_lang: str) -> str | None:
-    """Translate English text to target language using GPT-OSS 120B."""
-    if not EIGEN_KEY:
-        return None
-    tgt = LANGUAGES.get(target_lang, target_lang)
-    # Very strict prompt to prevent hallucination
-    messages = [
-        {"role": "system", "content": f"You are a translator. Translate the following English text to {tgt}. Reply with ONLY the translated text, nothing else. Do not add explanations, quotes, or extra content."},
-        {"role": "user", "content": text},
-    ]
+async def api_translate(text: str, lang: str) -> str | None:
+    if not EIGEN_KEY: return None
+    import re as _re
+    tgt = LANGUAGES.get(lang, lang)
     try:
         client = await get_http()
-        resp = await client.post(
-            f"{EIGEN_BASE}/api/v1/chat/completions",
-            headers={"Authorization": f"Bearer {EIGEN_KEY}", "Content-Type": "application/json"},
-            json={"model": "gpt-oss-120b", "messages": messages, "temperature": 0.1, "max_tokens": 300},
-        )
-        if resp.status_code == 429:
-            await asyncio.sleep(0.5)
+        for attempt in range(3):
             resp = await client.post(
                 f"{EIGEN_BASE}/api/v1/chat/completions",
                 headers={"Authorization": f"Bearer {EIGEN_KEY}", "Content-Type": "application/json"},
-                json={"model": "gpt-oss-120b", "messages": messages, "temperature": 0.1, "max_tokens": 300},
+                json={
+                    "model": "gpt-oss-120b",
+                    "messages": [
+                        {"role": "system", "content": f"Translate to {tgt}. Reply with ONLY the translated text, no markdown, no quotes, no asterisks."},
+                        {"role": "user", "content": text},
+                    ],
+                    "temperature": 0.1, "max_tokens": 300,
+                },
             )
-        if resp.status_code != 200:
-            return None
-        result = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-        # Strip quotes that models sometimes add
-        result = result.strip("\"'`")
-        # If result is way longer than input, it's likely hallucinating
-        if len(result) > len(text) * 4:
-            return None
-        return result if result else None
+            if resp.status_code == 429:
+                wait = (attempt + 1) * 2
+                L(f"[GPT-OSS] 429 rate limit — retry {attempt+1}/3 in {wait}s")
+                await asyncio.sleep(wait)
+                continue
+            if resp.status_code != 200:
+                L(f"[GPT-OSS] HTTP {resp.status_code}")
+                return None
+            result = resp.json().get("choices", [{}])[0].get("message", {}).get("content", "")
+            # Strip markdown artifacts
+            result = _re.sub(r'\*+', '', result)
+            result = result.strip("\"'`_ \n")
+            if not result: return None
+            if len(result) > len(text) * 4: return None   # hallucination guard
+            return result
+        return None
     except Exception as e:
-        print(f"[Translate Error] {e}")
+        L(f"[GPT-OSS] Error: {e}")
         return None
 
 
-QWEN3_LANG = {
-    "es": "Spanish", "ja": "Japanese", "zh": "Chinese",
-    "fr": "French", "de": "German", "it": "Italian",
-    "ko": "Korean", "ru": "Russian",
-}
-
-async def _qwen3_tts_stream(text: str, speed: float = 1.0, lang: str = "es") -> tuple[bytes | None, int]:
+async def api_tts(text: str, speed: float = 1.0, voice_ref_wav: bytes | None = None) -> bytes | None:
+    """Higgs TTS 2.5.
+    With voice_ref → multipart POST (voice clone) → returns WAV bytes.
+    Without → SSE streaming → returns raw PCM16 bytes at 24kHz.
     """
-    Qwen3 TTS via WebSocket streaming. Returns (pcm_bytes, sample_rate).
-    Binary PCM chunks streamed directly — no base64 overhead.
-    """
-    if not EIGEN_KEY:
-        return None, 24000
-    try:
-        import websockets
-        uri = "wss://api-web.eigenai.com/api/v1/generate/ws"
-        language = QWEN3_LANG.get(lang, "Auto")
-
-        pcm_data = bytearray()
-        sample_rate = 24000
-
-        async with websockets.connect(uri, ping_interval=None) as ws:
-            # 1. Authenticate
-            await ws.send(json.dumps({"token": EIGEN_KEY, "model": "qwen3-tts"}))
-            auth_raw = await ws.recv()
-            auth = json.loads(auth_raw) if isinstance(auth_raw, str) else {}
-            if auth.get("status") not in ("authenticated", "ok", None):
-                print(f"[Qwen3] Auth unexpected: {auth_raw}")
-
-            # 2. Send TTS request
-            await ws.send(json.dumps({
-                "text": text,
-                "voice": "Vivian",
-                "language": language,
-                "voice_settings": {"speed": speed},
-            }))
-
-            # 3. Stream binary PCM chunks
-            async for message in ws:
-                if isinstance(message, bytes):
-                    pcm_data.extend(message)
-                else:
-                    data = json.loads(message)
-                    if data.get("sample_rate"):
-                        sample_rate = int(data["sample_rate"])
-                    elif data.get("type") == "complete":
-                        break
-
-        return (bytes(pcm_data) if len(pcm_data) > 1000 else None), sample_rate
-    except Exception as e:
-        print(f"[Qwen3 TTS Error] {e}")
-        return None, 24000
-
-
-async def _higgs_tts_stream(text: str, speed: float = 1.0,
-                            voice_ref_wav: bytes | None = None) -> bytes | None:
-    """
-    Higgs 2.5 TTS.
-    - With voice_ref: multipart POST with voice cloning (returns WAV bytes directly).
-    - Without voice_ref: SSE streaming, collect PCM16 chunks.
-    """
-    if not EIGEN_KEY:
-        return None
+    if not EIGEN_KEY: return None
     clone = voice_ref_wav and len(voice_ref_wav) > 3200
     try:
         client = await get_http()
@@ -629,70 +559,58 @@ async def _higgs_tts_stream(text: str, speed: float = 1.0,
                 f"{EIGEN_BASE}/api/v1/generate",
                 headers={"Authorization": f"Bearer {EIGEN_KEY}"},
                 data={
-                    "model": "higgs2p5",
-                    "text": text,
+                    "model": "higgs2p5", "text": text,
                     "voice_settings": json.dumps({"speed": speed}),
                     "sampling": json.dumps({"temperature": 0.85, "top_p": 0.95, "top_k": 50}),
                 },
                 files={"voice_reference_file": ("speaker.wav", voice_ref_wav, "audio/wav")},
             )
             if resp.status_code != 200:
-                print(f"[Higgs TTS clone] HTTP {resp.status_code}")
+                L(f"[TTS-clone] HTTP {resp.status_code}")
                 return None
-            # Response is raw WAV audio bytes — return as-is (already has WAV header)
             return resp.content if len(resp.content) > 1000 else None
         else:
             # SSE streaming — collect base64 PCM16 chunks
-            pcm_data = bytearray()
-            async with client.stream("POST", f"{EIGEN_BASE}/api/v1/generate",
+            pcm = bytearray()
+            async with client.stream(
+                "POST", f"{EIGEN_BASE}/api/v1/generate",
                 headers={"Authorization": f"Bearer {EIGEN_KEY}", "Content-Type": "application/json"},
                 json={"model": "higgs2p5", "text": text, "stream": True,
                       "voice_settings": {"speed": speed},
                       "sampling": {"temperature": 0.85, "top_p": 0.95, "top_k": 50}},
             ) as resp:
-                buffer = ""
+                buf = ""
                 async for chunk in resp.aiter_text():
-                    buffer += chunk
-                    while "\n" in buffer:
-                        line, buffer = buffer.split("\n", 1)
+                    buf += chunk
+                    while "\n" in buf:
+                        line, buf = buf.split("\n", 1)
                         line = line.strip()
-                        if not line or not line.startswith("data: "):
-                            continue
+                        if not line.startswith("data: "): continue
                         data = json.loads(line[6:])
                         if isinstance(data.get("data"), str) and len(data["data"]) > 50:
-                            pcm_data.extend(base64.b64decode(data["data"]))
-                        if data.get("type") == "done":
-                            break
-            return bytes(pcm_data) if len(pcm_data) > 1000 else None
+                            pcm.extend(base64.b64decode(data["data"]))
+                        if data.get("type") == "done": break
+            return bytes(pcm) if len(pcm) > 1000 else None
     except Exception as e:
-        print(f"[Higgs TTS Error] {e}")
+        L(f"[TTS] Error: {e}")
         return None
 
 
-def _pcm_to_wav(pcm: bytes, sr: int) -> bytes | None:
-    """Convert PCM16 to WAV at given sample rate."""
-    if len(pcm) < 3200:
-        return None
+# ─── Utilities ───
+
+def pcm_to_wav(pcm: bytes, sr: int) -> bytes | None:
+    if len(pcm) < 3200: return None
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sr)
+        wf.setnchannels(1); wf.setsampwidth(2); wf.setframerate(sr)
         wf.writeframes(pcm)
     return buf.getvalue()
 
+_NOISE = {"thank you","thanks","thanks for watching","bye","goodbye","the end",
+          "subscribe","like and subscribe","silence","...",".",""," "}
 
-def _pcm_to_wav_24k(pcm: bytes) -> bytes | None:
-    """Convert PCM16 to WAV at 24kHz (TTS output format)."""
-    return _pcm_to_wav(pcm, 24000)
-
-
-_NOISE = {"thank you", "thanks", "thanks for watching", "bye", "goodbye", "the end",
-          "subscribe", "like and subscribe", "thanks for listening", "subtitles", "silence", "...", ".", ""}
-
-def _is_noise(text: str) -> bool:
-    if not text:
-        return True
+def is_noise(text: str) -> bool:
+    if not text: return True
     c = text.strip().lower().rstrip(".!?,")
     return not c or c in _NOISE or (len(c.split()) > 2 and len(set(c.split())) == 1)
 
