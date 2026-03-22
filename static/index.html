@@ -287,7 +287,7 @@ function playB64(b64) {
   });
 }
 
-// ═══ AUDIO QUEUE — sequential playback, video keeps running ═══
+// ═══ AUDIO QUEUE — timestamp-synced playback ═══
 const audioQueue = [];
 let queueDraining = false;
 let queueCancelled = false;
@@ -306,21 +306,57 @@ function enqueueChunk(m) {
   if (!queueDraining) drainAudioQueue();
 }
 
+// Wait until video reaches targetTime, polling every 50ms.
+// Resolves immediately if already past, or if queue is cancelled.
+function waitUntilVideoTime(targetTime) {
+  return new Promise(resolve => {
+    if (!ytPlayer || typeof ytPlayer.getCurrentTime !== 'function') return resolve();
+    if (ytPlayer.getCurrentTime() >= targetTime || queueCancelled) return resolve();
+    const poll = setInterval(() => {
+      if (queueCancelled || !ytPlayer || ytPlayer.getCurrentTime() >= targetTime) {
+        clearInterval(poll);
+        resolve();
+      }
+    }, 50);
+  });
+}
+
 async function drainAudioQueue() {
   queueDraining = true;
   queueCancelled = false;
 
   while (audioQueue.length > 0 && !queueCancelled) {
     const m = audioQueue.shift();
+    const startS  = m.start_s  ?? 0;
+    const durS    = m.dur_s    ?? 3;
+    const endS    = startS + durS;
 
-    // Show subtitle
+    // ── Timestamp sync ──
+    const videoNow = ytPlayer ? ytPlayer.getCurrentTime() : 0;
+
+    // Late: video has already passed this chunk's window → discard silently
+    if (videoNow > endS + 0.3) {
+      const lateBy = (videoNow - startS).toFixed(1);
+      document.getElementById('lang-status').textContent = `#${m.index+1} late by ${lateBy}s — skipped`;
+      continue;
+    }
+
+    // Early: dubbed audio is ready before the video gets there → wait
+    if (videoNow < startS) {
+      document.getElementById('lang-status').textContent =
+        `#${m.index+1} ready — waiting for ${startS.toFixed(1)}s`;
+      await waitUntilVideoTime(startS);
+    }
+
+    if (queueCancelled) break;
+
+    // ── Play ──
     if (m.transcript || m.translation) {
       document.getElementById('sub-orig').textContent = m.transcript || '';
       document.getElementById('sub-trans').textContent = m.translation || '';
       document.getElementById('subtitle-bar').classList.add('visible');
     }
 
-    // Highlight current transcript row
     document.getElementById('transcript-list').querySelectorAll('.current').forEach(el => el.classList.remove('current'));
     const cur = document.getElementById('ti-' + m.index);
     if (cur) { cur.classList.add('current'); cur.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
@@ -330,12 +366,10 @@ async function drainAudioQueue() {
     document.getElementById('lang-status').textContent =
       `Playing ${m.index+1}/${m.total}` + (m.cached ? ' (cached)' : '');
 
-    // Mute video while dubbed audio plays
     setVol(0);
     if (m.audio_b64) await playB64(m.audio_b64);
     if (queueCancelled) break;
 
-    // Small gap between chunks — let a little background through
     if (audioQueue.length === 0 && isDubbing) {
       setVol(15);
       document.getElementById('lang-status').textContent = 'Translating next chunk...';
