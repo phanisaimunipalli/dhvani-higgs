@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dhvani — Real-time Video Dubbing</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    :root{
+      --bg:#141414;--surface:#1a1a1a;--surface2:#222;--surface3:#2a2a2a;
+      --border:#333;--border2:#444;
+      --red:#e50914;--red-dark:#b20710;--red-glow:rgba(229,9,20,.4);
+      --green:#46d369;--green-dim:rgba(70,211,105,.15);
+      --yellow:#e5a00d;--yellow-dim:rgba(229,160,13,.15);
+      --text:#fff;--text2:#b3b3b3;--text3:#808080;--text4:#666;
+      --mono:'JetBrains Mono',monospace;--sans:'Inter',-apple-system,system-ui,sans-serif;
+      --radius:8px;--radius-lg:12px;
+    }
+    html,body{height:100%;overflow:hidden}
+    body{background:var(--bg);color:var(--text);font-family:var(--sans);display:flex;flex-direction:column}
+
+    /* ═══ HEADER ═══ */
+    header{
+      display:flex;align-items:center;justify-content:space-between;
+      padding:10px 24px;background:rgba(20,20,20,.95);
+      border-bottom:1px solid var(--border);z-index:10;
+    }
+    .brand{display:flex;align-items:center;gap:12px}
+    .brand h1{font-size:22px;font-weight:900;color:var(--red);letter-spacing:1px;text-transform:uppercase}
+    .brand-sub{font-size:10px;color:var(--text3);font-weight:500;letter-spacing:.5px;text-transform:uppercase}
+    .hdr-right{display:flex;gap:8px;align-items:center}
+    .hdr-pill{
+      font-family:var(--mono);font-size:10px;padding:5px 12px;border-radius:4px;
+      background:var(--surface2);border:1px solid var(--border);color:var(--text3);font-weight:500;
+      transition:all .3s;
+    }
+    .hdr-pill.ok{color:var(--green);border-color:rgba(70,211,105,.3);background:var(--green-dim)}
+    .hdr-pill.live{color:var(--red);border-color:rgba(229,9,20,.3);background:rgba(229,9,20,.1);animation:pulse-pill 1.5s infinite}
+    @keyframes pulse-pill{0%,100%{opacity:1}50%{opacity:.6}}
+
+    /* ═══ MAIN LAYOUT ═══ */
+    .main{flex:1;display:flex;overflow:hidden}
+
+    /* ═══ LEFT: VIDEO + CONTROLS ═══ */
+    .left-panel{flex:1;display:flex;flex-direction:column;min-width:0}
+
+    .video-area{
+      flex:1;display:flex;align-items:center;justify-content:center;
+      background:#000;position:relative;overflow:hidden;
+    }
+    .video-placeholder{text-align:center;color:var(--text3);padding:60px 40px}
+    .video-placeholder .vp-icon{font-size:64px;margin-bottom:20px;opacity:.3}
+    .video-placeholder h2{font-size:28px;font-weight:800;color:var(--text);margin-bottom:8px;letter-spacing:-.5px}
+    .video-placeholder p{font-size:13px;line-height:1.7;max-width:400px;margin:0 auto;color:var(--text2)}
+    .video-placeholder .hint{
+      margin-top:16px;font-size:11px;color:var(--text3);font-weight:500;
+      padding:6px 16px;border-radius:4px;display:inline-block;
+      background:var(--surface2);border:1px solid var(--border);
+    }
+
+    #yt-player-wrap{display:none;width:100%;height:100%;position:relative}
+    #yt-player-wrap iframe{width:100%;height:100%;border:none}
+
+    /* Subtitle overlay */
+    .subtitle-bar{
+      position:absolute;bottom:24px;left:50%;transform:translateX(-50%);
+      max-width:70%;min-width:300px;
+      padding:10px 24px;border-radius:4px;
+      background:rgba(0,0,0,.85);
+      color:white;font-size:15px;font-weight:500;text-align:center;line-height:1.4;
+      display:none;z-index:5;
+    }
+    .subtitle-bar .sub-orig{font-size:11px;color:rgba(255,255,255,.4);margin-bottom:4px;font-weight:400}
+    .subtitle-bar .sub-trans{font-size:16px;font-weight:600}
+    .subtitle-bar.visible{display:block;animation:subIn .2s ease}
+    @keyframes subIn{from{opacity:0;transform:translateX(-50%) translateY(6px)}to{opacity:1;transform:translateX(-50%) translateY(0)}}
+
+    /* Controls bar under video */
+    .controls-bar{
+      padding:12px 24px;background:var(--surface);border-top:1px solid var(--border);
+      display:flex;align-items:center;gap:12px;
+    }
+    .url-input{
+      flex:1;padding:8px 12px;border-radius:var(--radius);
+      border:1px solid var(--border);background:var(--surface2);
+      font-family:var(--sans);font-size:13px;color:var(--text);
+    }
+    .url-input:focus{outline:none;border-color:var(--red)}
+    .url-input::placeholder{color:var(--text4)}
+    .load-btn{
+      padding:8px 20px;border-radius:var(--radius);border:none;
+      background:var(--red);color:white;
+      font-size:13px;font-weight:700;cursor:pointer;transition:all .2s;
+      white-space:nowrap;font-family:var(--sans);
+    }
+    .load-btn:hover{background:var(--red-dark)}
+    .load-btn:disabled{opacity:.3;cursor:not-allowed}
+    .video-title{font-size:11px;color:var(--text3);font-weight:500;max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+    /* Language pills row */
+    .lang-row{
+      padding:8px 24px;background:var(--surface);border-top:1px solid var(--border);
+      display:flex;align-items:center;gap:8px;
+    }
+    .lang-label{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--text4);margin-right:4px}
+    .lang-pill{
+      padding:6px 16px;border-radius:4px;border:1px solid var(--border);
+      background:var(--surface2);color:var(--text2);
+      font-size:12px;font-weight:600;cursor:pointer;transition:all .2s;
+      display:flex;align-items:center;gap:6px;
+    }
+    .lang-pill.disabled{opacity:.3;pointer-events:none}
+    .lang-pill:hover{border-color:var(--text3);color:var(--text)}
+    .lang-pill.active{border-color:var(--red);color:var(--red);background:rgba(229,9,20,.1)}
+    .lang-pill .dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
+    .lang-pill .dot.idle{background:var(--text4)}
+    .lang-pill .dot.processing{background:var(--yellow);animation:pulse-dot 1s infinite}
+    .lang-pill .dot.cached{background:var(--green)}
+    .lang-pill .dot.playing{background:var(--red);animation:pulse-dot 1s infinite}
+    @keyframes pulse-dot{0%,100%{opacity:1}50%{opacity:.3}}
+    .lang-status-text{font-size:10px;color:var(--text4);margin-left:auto;font-family:var(--mono)}
+
+    /* ═══ RIGHT: TRANSCRIPT PANEL ═══ */
+    .transcript-panel{
+      width:380px;display:flex;flex-direction:column;
+      background:var(--surface);border-left:1px solid var(--border);
+    }
+    .tp-header{
+      padding:12px 16px;border-bottom:1px solid var(--border);
+      display:flex;align-items:center;justify-content:space-between;
+    }
+    .tp-header h3{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:1px;color:var(--text3)}
+    .tp-header .chunk-counter{font-family:var(--mono);font-size:11px;color:var(--text4)}
+
+    .transcript-list{flex:1;overflow-y:auto;padding:8px 0}
+    .transcript-item{
+      padding:10px 16px;border-bottom:1px solid rgba(255,255,255,.04);
+      transition:background .2s;
+    }
+    .transcript-item:hover{background:var(--surface2)}
+    .transcript-item.current{background:rgba(229,9,20,.08);border-left:3px solid var(--red)}
+    .ti-meta{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+    .ti-chunk{font-family:var(--mono);font-size:10px;color:var(--text4);font-weight:600}
+    .ti-emotion{font-size:11px}
+    .ti-latency{font-family:var(--mono);font-size:10px;color:var(--text4);margin-left:auto}
+    .ti-cached{font-size:9px;color:var(--green);font-weight:600;text-transform:uppercase;margin-left:auto}
+    .ti-skip{font-size:9px;color:var(--yellow);font-weight:600;text-transform:uppercase;margin-left:auto}
+    .ti-orig{font-size:12px;color:var(--text3);margin-bottom:3px;line-height:1.4}
+    .ti-trans{font-size:13px;color:var(--text);font-weight:500;line-height:1.4}
+
+    .tp-empty{
+      flex:1;display:flex;align-items:center;justify-content:center;
+      color:var(--text4);font-size:13px;text-align:center;padding:40px;line-height:1.6;
+    }
+    .tp-empty.hidden{display:none}
+
+    /* ═══ BOTTOM ═══ */
+    .bottom-bar{
+      padding:6px 24px;background:var(--surface);
+      border-top:1px solid var(--border);
+      display:flex;align-items:center;justify-content:space-between;
+      font-size:10px;color:var(--text4);
+    }
+    .tech-stack{display:flex;gap:8px}
+    .tech-tag{padding:2px 8px;border-radius:3px;background:var(--surface2);font-weight:500}
+
+    ::-webkit-scrollbar{width:4px}
+    ::-webkit-scrollbar-track{background:transparent}
+    ::-webkit-scrollbar-thumb{background:var(--border);border-radius:4px}
+    ::-webkit-scrollbar-thumb:hover{background:var(--border2)}
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <div>
+      <h1>Dhvani</h1>
+      <div class="brand-sub">Real-time Video Dubbing &middot; Higgs Audio</div>
+    </div>
+  </div>
+  <div class="hdr-right">
+    <span class="hdr-pill" id="latency-pill">Ready</span>
+  </div>
+</header>
+
+<div class="main">
+  <div class="left-panel">
+    <div class="video-area">
+      <div class="video-placeholder" id="placeholder">
+        <div class="vp-icon">&#x1F3AC;</div>
+        <h2>Paste a YouTube URL</h2>
+        <p>Select a language and Dhvani dubs the audio in real-time with voice cloning and emotion preservation.</p>
+        <div class="hint">On-demand dubbing &#x2022; Voice cloning &#x2022; Emotion sync</div>
+      </div>
+      <div id="yt-player-wrap"></div>
+      <div class="subtitle-bar" id="subtitle-bar">
+        <div class="sub-orig" id="sub-orig"></div>
+        <div class="sub-trans" id="sub-trans"></div>
+      </div>
+    </div>
+
+    <div class="controls-bar">
+      <input type="text" class="url-input" id="yt-url" placeholder="Paste YouTube URL..." />
+      <button class="load-btn" id="load-btn" onclick="loadVideo()">Load</button>
+      <span class="video-title" id="video-title"></span>
+    </div>
+
+    <div class="lang-row" id="lang-row">
+      <span class="lang-label">Dub:</span>
+      <div class="lang-pill disabled" data-lang="es" onclick="selectLang('es')">
+        <span class="dot idle" id="dot-es"></span>
+        &#x1F1EA;&#x1F1F8; Spanish
+      </div>
+      <div class="lang-pill disabled" data-lang="ja" onclick="selectLang('ja')">
+        <span class="dot idle" id="dot-ja"></span>
+        &#x1F1EF;&#x1F1F5; Japanese
+      </div>
+      <div class="lang-pill disabled" data-lang="zh" onclick="selectLang('zh')">
+        <span class="dot idle" id="dot-zh"></span>
+        &#x1F1E8;&#x1F1F3; Chinese
+      </div>
+      <span class="lang-status-text" id="lang-status">Load a video to start</span>
+    </div>
+  </div>
+
+  <div class="transcript-panel">
+    <div class="tp-header">
+      <h3>Transcript</h3>
+      <span class="chunk-counter" id="chunk-counter"></span>
+    </div>
+    <div class="tp-empty" id="tp-empty">
+      Select a language to see<br/>original and translated transcript
+    </div>
+    <div class="transcript-list" id="transcript-list"></div>
+  </div>
+</div>
+
+<div class="bottom-bar">
+  <span>Dhvani v2.0 &middot; Boson AI x Eigen AI Hackathon 2026</span>
+  <div class="tech-stack">
+    <span class="tech-tag">Higgs ASR 3</span>
+    <span class="tech-tag">Higgs TTS 2.5</span>
+    <span class="tech-tag">Voice Clone</span>
+    <span class="tech-tag">Emotion</span>
+  </div>
+</div>
+
+<script>
+let ws = null;
+let sessionId = null;
+let ytPlayer = null;
+let currentLang = null;
+let totalChunks = 0;
+let isDubbing = false;
+
+// ═══ AUDIO ═══
+let audioCtx = null;
+function getAudioCtx() {
+  if (!audioCtx || audioCtx.state === 'closed')
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  return audioCtx;
+}
+let currentAudioSource = null;
+function stopAudio() {
+  if (currentAudioSource) { try { currentAudioSource.stop(); } catch(e) {} currentAudioSource = null; }
+}
+function playB64(b64) {
+  return new Promise(resolve => {
+    try {
+      const ctx = getAudioCtx();
+      const bin = atob(b64);
+      const bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      ctx.decodeAudioData(bytes.buffer.slice(0), decoded => {
+        const src = ctx.createBufferSource();
+        src.buffer = decoded;
+        const gain = ctx.createGain(); gain.gain.value = 1.0;
+        src.connect(gain); gain.connect(ctx.destination);
+        currentAudioSource = src;
+        src.onended = () => { currentAudioSource = null; resolve(); };
+        src.start();
+      }, () => resolve());
+    } catch(e) { resolve(); }
+  });
+}
+
+// ═══ AUDIO QUEUE — sequential playback, video keeps running ═══
+const audioQueue = [];
+let queueDraining = false;
+let queueCancelled = false;
+
+function clearQueue() {
+  audioQueue.length = 0;
+  queueCancelled = true;
+  stopAudio();
+  queueDraining = false;
+}
+
+function enqueueChunk(m) {
+  audioQueue.push(m);
+  addTranscriptItem(m);
+  document.getElementById('chunk-counter').textContent = `${m.index+1} / ${m.total}`;
+  if (!queueDraining) drainAudioQueue();
+}
+
+async function drainAudioQueue() {
+  queueDraining = true;
+  queueCancelled = false;
+
+  while (audioQueue.length > 0 && !queueCancelled) {
+    const m = audioQueue.shift();
+
+    // Show subtitle
+    if (m.transcript || m.translation) {
+      document.getElementById('sub-orig').textContent = m.transcript || '';
+      document.getElementById('sub-trans').textContent = m.translation || '';
+      document.getElementById('subtitle-bar').classList.add('visible');
+    }
+
+    // Highlight current transcript row
+    document.getElementById('transcript-list').querySelectorAll('.current').forEach(el => el.classList.remove('current'));
+    const cur = document.getElementById('ti-' + m.index);
+    if (cur) { cur.classList.add('current'); cur.scrollIntoView({ behavior: 'smooth', block: 'nearest' }); }
+
+    document.getElementById('latency-pill').innerHTML =
+      `${m.index+1}/${m.total}` + (m.cached ? ' &#x26A1;' : ` ${m.latency}ms`);
+    document.getElementById('lang-status').textContent =
+      `Playing ${m.index+1}/${m.total}` + (m.cached ? ' (cached)' : '');
+
+    // Mute video while dubbed audio plays
+    setVol(0);
+    if (m.audio_b64) await playB64(m.audio_b64);
+    if (queueCancelled) break;
+
+    // Small gap between chunks — let a little background through
+    if (audioQueue.length === 0 && isDubbing) {
+      setVol(15);
+      document.getElementById('lang-status').textContent = 'Translating next chunk...';
+    }
+  }
+
+  queueDraining = false;
+  if (isDubbing && audioQueue.length === 0) {
+    setVol(15);
+    document.getElementById('lang-status').textContent = 'Translating next chunk...';
+  }
+}
+
+function setVol(v) {
+  if (ytPlayer && typeof ytPlayer.setVolume === 'function') ytPlayer.setVolume(v);
+}
+
+// ═══ LOAD VIDEO ═══
+async function loadVideo() {
+  const url = document.getElementById('yt-url').value.trim();
+  if (!url) return;
+  const btn = document.getElementById('load-btn');
+  btn.disabled = true; btn.textContent = 'Loading...';
+  document.getElementById('lang-status').textContent = 'Downloading audio...';
+
+  try {
+    const resp = await fetch('/api/youtube/prepare', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({url}),
+    });
+    const data = await resp.json();
+    if (data.error) {
+      document.getElementById('lang-status').textContent = 'Error: ' + data.error;
+      btn.disabled = false; btn.textContent = 'Load'; return;
+    }
+
+    sessionId = data.session_id;
+    totalChunks = data.chunks;
+
+    document.getElementById('video-title').textContent = data.title;
+    document.getElementById('placeholder').style.display = 'none';
+    const wrap = document.getElementById('yt-player-wrap');
+    wrap.style.display = 'block';
+    wrap.innerHTML = '<div id="yt-player-div"></div>';
+
+    if (window.YT && window.YT.Player) {
+      createPlayer(data.video_id);
+    } else {
+      const tag = document.createElement('script');
+      tag.src = 'https://www.youtube.com/iframe_api';
+      document.head.appendChild(tag);
+      window.onYouTubeIframeAPIReady = () => createPlayer(data.video_id);
+    }
+
+    btn.textContent = 'Loaded';
+    document.getElementById('lang-status').textContent = `${totalChunks} chunks | ${data.duration}s`;
+    document.getElementById('latency-pill').textContent = 'Ready';
+    document.getElementById('latency-pill').classList.add('ok');
+    document.getElementById('chunk-counter').textContent = `0 / ${totalChunks}`;
+    document.querySelectorAll('.lang-pill').forEach(c => c.classList.remove('disabled'));
+    connectWS();
+  } catch(e) {
+    document.getElementById('lang-status').textContent = 'Failed: ' + e.message;
+    btn.disabled = false; btn.textContent = 'Load';
+  }
+}
+
+function createPlayer(videoId) {
+  ytPlayer = new YT.Player('yt-player-div', {
+    width: '100%', height: '100%', videoId,
+    playerVars: { autoplay: 1, rel: 0, modestbranding: 1, iv_load_policy: 3 },
+    events: {
+      onReady: () => { ytPlayer.setVolume(100); ytPlayer.unMute(); },
+      onStateChange: onPlayerStateChange,
+    }
+  });
+}
+
+function onPlayerStateChange(event) {
+  if (!isDubbing || !currentLang) return;
+  if (event.data === 2) { // user paused
+    clearQueue();
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type: 'stop'}));
+    isDubbing = false;
+    setVol(100);
+    document.getElementById('subtitle-bar').classList.remove('visible');
+    document.getElementById('latency-pill').textContent = 'Paused';
+    document.getElementById('latency-pill').classList.remove('live');
+    document.getElementById('lang-status').textContent = 'Paused — click language to restart';
+  } else if (event.data === 0) { // ended
+    clearQueue();
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({type: 'stop'}));
+    isDubbing = false;
+    setVol(100);
+    document.getElementById('subtitle-bar').classList.remove('visible');
+    document.getElementById('latency-pill').textContent = 'Done';
+    document.getElementById('latency-pill').classList.remove('live');
+    document.getElementById('latency-pill').classList.add('ok');
+    document.getElementById('lang-status').textContent = 'Video ended.';
+  }
+}
+
+function getChunkIndex() {
+  if (!ytPlayer || typeof ytPlayer.getCurrentTime !== 'function') return 0;
+  return Math.floor(ytPlayer.getCurrentTime() / 3);
+}
+
+// ═══ WEBSOCKET ═══
+function connectWS() {
+  if (ws) ws.close();
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/dub/${sessionId}`);
+  ws.onmessage = e => onMsg(JSON.parse(e.data));
+  ws.onclose = () => { ws = null; };
+}
+
+function onMsg(m) {
+  switch(m.type) {
+    case 'ready':
+      totalChunks = m.total;
+      break;
+
+    case 'playing':
+      isDubbing = true;
+      setVol(15);
+      document.getElementById('latency-pill').textContent = 'Processing...';
+      document.getElementById('latency-pill').classList.remove('ok');
+      document.getElementById('latency-pill').classList.add('live');
+      const tpE = document.getElementById('tp-empty');
+      if (tpE) tpE.style.display = 'none';
+      break;
+
+    case 'processing':
+      document.getElementById('lang-status').textContent =
+        `Translating chunk ${m.index+1}/${m.total}...`;
+      break;
+
+    case 'chunk':
+      enqueueChunk(m);
+      if (currentLang) {
+        const dot = document.getElementById('dot-' + currentLang);
+        if (dot) dot.className = 'dot playing';
+      }
+      break;
+
+    case 'skip':
+      addSkipItem(m);
+      document.getElementById('chunk-counter').textContent = `${m.index+1} / ${m.total}`;
+      document.getElementById('lang-status').textContent = `#${m.index+1} — no translation, skipping`;
+      break;
+
+    case 'done': {
+      isDubbing = false;
+      const waitDone = setInterval(() => {
+        if (!queueDraining && audioQueue.length === 0) {
+          clearInterval(waitDone);
+          document.getElementById('subtitle-bar').classList.remove('visible');
+          document.getElementById('latency-pill').textContent = 'Done';
+          document.getElementById('latency-pill').classList.remove('live');
+          document.getElementById('latency-pill').classList.add('ok');
+          setVol(100);
+          const lang = m.lang || currentLang;
+          if (lang) { const dot = document.getElementById('dot-' + lang); if (dot) dot.className = 'dot cached'; }
+          document.getElementById('lang-status').textContent = 'Done. Cached for instant replay.';
+        }
+      }, 200);
+      break;
+    }
+
+    case 'stopped':
+      isDubbing = false;
+      clearQueue();
+      setVol(100);
+      document.getElementById('subtitle-bar').classList.remove('visible');
+      document.getElementById('latency-pill').textContent = 'Stopped';
+      document.getElementById('latency-pill').classList.remove('live');
+      break;
+
+    case 'error':
+      document.getElementById('lang-status').textContent = 'Error: ' + (m.message || '');
+      break;
+  }
+}
+
+// ═══ TRANSCRIPT ═══
+function addTranscriptItem(m) {
+  const list = document.getElementById('transcript-list');
+  const item = document.createElement('div');
+  item.className = 'transcript-item';
+  item.id = 'ti-' + m.index;
+  const timeStr = m.start_s !== undefined ? `${m.start_s.toFixed(1)}s` : '';
+  const latStr = m.cached ? '<span class="ti-cached">cached</span>' : `<span class="ti-latency">${m.latency}ms</span>`;
+  item.innerHTML = `
+    <div class="ti-meta">
+      <span class="ti-chunk">#${m.index+1} <span style="color:var(--text4)">${timeStr}</span></span>
+      ${latStr}
+    </div>
+    <div class="ti-orig">${escHtml(m.transcript || '')}</div>
+    <div class="ti-trans">${escHtml(m.translation || '')}</div>
+  `;
+  list.appendChild(item);
+  item.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function addSkipItem(m) {
+  const list = document.getElementById('transcript-list');
+  const item = document.createElement('div');
+  item.className = 'transcript-item'; item.id = 'ti-' + m.index;
+  item.innerHTML = `
+    <div class="ti-meta"><span class="ti-chunk">#${m.index+1}</span><span class="ti-skip">SKIPPED</span></div>
+    <div class="ti-orig">${escHtml(m.transcript || '')}</div>
+    <div class="ti-trans" style="color:var(--yellow);font-style:italic">No translation</div>
+  `;
+  list.appendChild(item);
+  item.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function escHtml(s) { const d = document.createElement('div'); d.textContent = s; return d.innerHTML; }
+
+// ═══ LANGUAGE SELECTION ═══
+function selectLang(lang) {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !sessionId) return;
+  getAudioCtx();
+
+  if (currentLang === lang) {
+    ws.send(JSON.stringify({type: 'stop'}));
+    clearQueue(); isDubbing = false;
+    document.querySelectorAll('.lang-pill').forEach(c => c.classList.remove('active'));
+    document.getElementById('subtitle-bar').classList.remove('visible');
+    setVol(100); currentLang = null;
+    document.getElementById('latency-pill').textContent = 'Ready';
+    document.getElementById('latency-pill').classList.remove('live');
+    document.getElementById('latency-pill').classList.add('ok');
+    document.getElementById('lang-status').textContent = 'Stopped';
+    return;
+  }
+
+  clearQueue();
+  document.getElementById('transcript-list').innerHTML = '';
+  const tpEmpty = document.getElementById('tp-empty');
+  if (tpEmpty) tpEmpty.style.display = 'none';
+
+  const fromIdx = getChunkIndex();
+  const msgType = currentLang ? 'switch' : 'play';
+  ws.send(JSON.stringify({type: msgType, lang, from: fromIdx}));
+
+  document.querySelectorAll('.lang-pill').forEach(c => c.classList.remove('active'));
+  document.querySelector(`.lang-pill[data-lang="${lang}"]`).classList.add('active');
+  ['es','ja','zh'].forEach(l => {
+    const dot = document.getElementById('dot-' + l);
+    if (dot) dot.className = l === lang ? 'dot processing' : 'dot idle';
+  });
+
+  document.getElementById('lang-status').textContent = 'Starting...';
+  currentLang = lang;
+}
+</script>
+</body>
+</html>

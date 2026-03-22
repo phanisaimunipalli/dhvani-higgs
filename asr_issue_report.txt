@@ -1,0 +1,33 @@
+Higgs ASR 3 — API returning 500 "Connection error"
+===================================================
+Timestamp: Sat, 21 Mar 2026 17:56:54 GMT (during hackathon)
+Reported by: Team Dhvani
+
+CURL REQUEST:
+-------------
+curl -X POST "https://api-web.eigenai.com/api/v1/generate" \
+  -H "Authorization: Bearer sk-" \
+  -F "model=higgs_asr_3" \
+  -F "file=@sample.wav;type=audio/wav"
+
+RESPONSE:
+---------
+HTTP/2 500
+content-type: application/json
+x-envoy-decorator-operation: eigen-asr-svc.fg-prod.svc.cluster.local:30250/*
+x-envoy-upstream-service-time: 1383
+x-kong-upstream-latency: 1388
+x-trace-id: 327bf92d8db01ff1d0b8f1d109b4f716
+
+{"detail":"Connection error."}
+
+NOTES:
+------
+- Same file + same key works fine with higgs2p5 (TTS) → returns 200 + valid WAV audio
+- Also tried model=asr → 502 "Failed to process request"
+- The envoy header shows it's routing to eigen-asr-svc which seems to be down
+- Audio file: 161KB WAV, 24kHz mono, 3.4s duration
+- We need ASR working to complete our voice-to-voice translation demo (Dhvani)
+- Blocking our hackathon submission
+
+Can someone check the ASR service? Thank you!
