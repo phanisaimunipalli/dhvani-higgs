@@ -199,4 +199,15 @@ Guard in place: chunks > 500KB are dropped.
 
 ---
 
+---
+
+## Contributors
+
+| Name | GitHub |
+|------|--------|
+| Phani Sai Ram Munipalli | [@phanisaimunipalli](https://github.com/phanisaimunipalli) |
+| Vinay Mokidi | [@vinaymokidi-mk](https://github.com/vinaymokidi-mk) |
+
+---
+
 *Dhvani (ध्वनि) — Sanskrit for "sound"*
